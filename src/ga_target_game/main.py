@@ -10,11 +10,11 @@ dos números hasta acertar al blanco.
     el vuelo, descontando el radio de impacto. 0 significa que acierta.
 
 Uso:
-    pip install pymunk pygame
-    python tiro_al_blanco.py                 # evolución con animación (con muro)
-    python tiro_al_blanco.py --sin-muro      # sin obstáculo: casi trivial
-    python tiro_al_blanco.py --no-gui        # solo evolución, por consola
-    python tiro_al_blanco.py --seed 7 --generations 40
+    uv sync          # instala pygame y pymunk (declarados en pyproject.toml)
+    uv run python src/ga_target_game/main.py              # con animación y muro
+    uv run python src/ga_target_game/main.py --sin-muro   # sin obstáculo: casi trivial
+    uv run python src/ga_target_game/main.py --no-gui     # solo evolución, por consola
+    uv run python src/ga_target_game/main.py --seed 7 --generations 40
 """
 
 from __future__ import annotations
@@ -53,6 +53,10 @@ POWER_MIN, POWER_MAX = 100.0, 1400.0  # px/s
 
 def decode(genes: list[float]) -> tuple[float, float]:
     """Devuelve (ángulo en radianes, potencia en px/s)."""
+    # [BRKGA] DECODIFICADOR: es la única pieza que conoce el problema.
+    # El algoritmo genético solo manipula llaves aleatorias en [0, 1]; aquí se
+    # traducen a una solución real mediante un escalado lineal a cada rango.
+    # Así cualquier hijo (cruce o mutante) es siempre una solución factible.
     angle = math.radians(ANGLE_MIN + genes[0] * (ANGLE_MAX - ANGLE_MIN))
     power = POWER_MIN + genes[1] * (POWER_MAX - POWER_MIN)
     return angle, power
@@ -67,6 +71,7 @@ def simulate(
     La trayectoria solo se guarda si ``record=True`` (para dibujarla). Durante la
     evolución se llama sin grabar, que es bastante más rápido.
     """
+    # [BRKGA] FUNCIÓN DE EVALUACIÓN: cromosoma -> decodificar -> simular -> costo.
     angle, power = decode(genes)
 
     space = pymunk.Space()
@@ -97,7 +102,9 @@ def simulate(
             # Se actualiza el Space en este intervalo
             space.step(DT / SUBSTEPS)
             x, y = body.position
-            print(f"x = {x}, y = {y}")
+            # Fitness = distancia MÍNIMA al blanco en toda la trayectoria. Medirla
+            # en cada subpaso da una señal suave: un tiro que "casi" pasa por el
+            # blanco puntúa mejor que uno lejano, aunque ninguno acierte.
             best = min(best, math.hypot(x - TARGET_POS[0], y - TARGET_POS[1]))
             if best <= HIT_DIST:  # acierto
                 finished = True
@@ -110,6 +117,7 @@ def simulate(
         if finished:
             break
 
+    # Se descuenta el radio de impacto: costo 0.0 = acierto (óptimo global).
     return max(0.0, best - HIT_DIST), path
 
 
@@ -139,36 +147,58 @@ def evolve(
         wall: Si True, hay un muro entre el lanzador y el blanco.
         seed: Semilla para repetir la misma evolución.
     """
-    rng = random.Random(seed)
+    rng = random.Random(seed)  # RNG propio: con la misma semilla, misma evolución
+    # [BRKGA] PARTICIÓN DE LA POBLACIÓN (p = pop_size):
+    #   p_e = n_elite   -> mejores individuos, se copian sin cambios (elitismo)
+    #   p_m = n_mutants -> individuos aleatorios nuevos (única fuente de diversidad)
+    #   p - p_e - p_m   -> hijos de cruce élite × no-élite
     n_elite = max(1, int(pop_size * elite_frac))
     n_mutants = max(1, int(pop_size * mutant_frac))
-    n_genes = 2
+    n_genes = 2  # tamaño del cromosoma: [llave del ángulo, llave de la potencia]
 
     def new_individual(genes: list[float] | None = None) -> Individual:
+        # Sin genes -> vector de llaves aleatorias uniformes en [0, 1).
+        # Se evalúa al crearlo, así cada individuo guarda su costo.
         genes = genes or [rng.random() for _ in range(n_genes)]
         return Individual(genes, simulate(genes, wall)[0])
 
+    # [BRKGA] POBLACIÓN INICIAL: p vectores de llaves aleatorias.
     population = [new_individual() for _ in range(pop_size)]
     print("===" * 20)
     # print(population)
     for gen in range(generations + 1):
+        # [BRKGA] CLASIFICACIÓN: ordenar por costo (minimización).
         population.sort(key=lambda ind: ind.cost)
         best = population[0]
         yield gen, best
+        # CRITERIO DE PARADA: acierto (costo 0) o agotar las generaciones.
         if best.cost == 0.0:
             return  # ya acierta: no hace falta seguir
 
+        # [BRKGA] Separar élite (los p_e mejores) del resto (no-élite).
         elite, rest = population[:n_elite], population[n_elite:]
+        # [BRKGA] ELITISMO: la élite pasa intacta; no se re-evalúa porque la
+        # simulación es determinista. Garantiza que el mejor nunca empeora.
         next_pop = list(elite)
+        # [BRKGA] MUTANTES: individuos totalmente aleatorios. BRKGA no tiene
+        # operador de mutación gen a gen; la exploración viene de aquí.
         next_pop += [new_individual() for _ in range(n_mutants)]
+        # [BRKGA] CRUCE: completa la población con hijos.
         while len(next_pop) < pop_size:
+            # Selección SESGADA: un padre siempre de la élite y otro del resto
+            # (en un GA clásico ambos padres saldrían de toda la población).
             parent_e = rng.choice(elite)
             parent_o = rng.choice(rest or elite)
+            # Cruce uniforme parametrizado: cada gen viene del padre élite con
+            # probabilidad rho (> 0.5), así el hijo hereda más del mejor padre.
+            # Nota: con 2 genes solo hay 4 combinaciones posibles; el cruce no
+            # crea valores nuevos, solo recombina los existentes.
             child = [
                 e if rng.random() < rho else o
                 for e, o in zip(parent_e.genes, parent_o.genes, strict=True)
             ]
             next_pop.append(new_individual(child))
+        # [BRKGA] REEMPLAZO GENERACIONAL: élite + mutantes + hijos.
         population = next_pop
 
 

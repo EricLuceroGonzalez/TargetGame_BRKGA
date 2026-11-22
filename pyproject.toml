@@ -5,7 +5,10 @@ description = "A game based on genetic algorithms to learn Pygame and pymunk"
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "Eric Lucero Gonzalez", email = "ericlucerog@gmail.com" }]
-dependencies = []
+dependencies = [
+    "pygame>=2.6.1",
+    "pymunk>=7.3.1",
+]
 
 [dependency-groups]
 dev = [
@@ -38,3 +41,8 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["ga_target_game"]
+
+[tool.pylint.main]
+# pygame y pymunk son extensiones en C: sin esto pylint no ve sus miembros
+# y marca falsos positivos como "Module 'pygame' has no 'init' member" (E1101).
+extension-pkg-allow-list = ["pygame", "pymunk"]
