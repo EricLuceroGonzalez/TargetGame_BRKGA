@@ -31,24 +31,24 @@ import pymunk
 logger = logging.getLogger(__name__)
 
 # ── Escena (coordenadas de pygame: y crece hacia abajo) ─────────────────────
-WIDTH, HEIGHT = 800, 800
-GROUND_Y = 660
-GRAVITY = 800.0
+WIDTH, HEIGHT = 1280, 720
+GROUND_Y = HEIGHT - 20
+GRAVITY = 900.0
 DT = 1 / 60
 MAX_STEPS = 60 * 8  # un tiro nunca dura más de 8 s simulados
 SUBSTEPS = 4  # subpasos por fotograma: evita que la bola atraviese el muro
 
-BALL_R = 8
-LAUNCH_POS = (80.0, GROUND_Y - 20.0)
-TARGET_POS = (760.0, GROUND_Y - 10.0)
-TARGET_R = 10
+BALL_R = 10
+LAUNCH_POS = (80.0, GROUND_Y - 5.0)
+TARGET_POS = (860.0, GROUND_Y - 10.0)
+TARGET_R = 20
 HIT_DIST = TARGET_R + BALL_R  # a esta distancia del centro, la bola toca el blanco
 
-WALL_X, WALL_H, WALL_W = 420.0, 500.0, 35
+WALL_X, WALL_H, WALL_W = 420.0, 400.0, 65
 
 # ── Decodificador: genes en [0, 1] -> parámetros reales ─────────────────────
 ANGLE_MIN, ANGLE_MAX = 2.0, 85.0  # grados
-POWER_MIN, POWER_MAX = 300.0, 1400.0  # px/s
+POWER_MIN, POWER_MAX = 100.0, 1400.0  # px/s
 
 
 def decode(genes: list[float]) -> tuple[float, float]:
@@ -94,8 +94,10 @@ def simulate(
     finished = False
     for _ in range(MAX_STEPS):
         for _ in range(SUBSTEPS):
+            # Se actualiza el Space en este intervalo
             space.step(DT / SUBSTEPS)
             x, y = body.position
+            print(f"x = {x}, y = {y}")
             best = min(best, math.hypot(x - TARGET_POS[0], y - TARGET_POS[1]))
             if best <= HIT_DIST:  # acierto
                 finished = True
@@ -120,7 +122,7 @@ class Individual:
 
 def evolve(
     pop_size: int = 20,
-    generations: int = 30,
+    generations: int = 100,
     elite_frac: float = 0.2,
     mutant_frac: float = 0.2,
     rho: float = 0.7,
@@ -147,7 +149,8 @@ def evolve(
         return Individual(genes, simulate(genes, wall)[0])
 
     population = [new_individual() for _ in range(pop_size)]
-
+    print("===" * 20)
+    # print(population)
     for gen in range(generations + 1):
         population.sort(key=lambda ind: ind.cost)
         best = population[0]
@@ -183,17 +186,27 @@ def run_gui(args: argparse.Namespace) -> None:
 
     def draw(frame_path, upto, gen, best, done) -> None:
         screen.fill((245, 245, 240))
-        pygame.draw.line(screen, (60, 60, 60), (0, GROUND_Y), (WIDTH, GROUND_Y), 3)
+        # Linea horizontal del suelo
+        colorFloor = (160, 160, 60)
+        pygame.draw.line(
+            surface=screen,
+            color=colorFloor,
+            start_pos=(0, GROUND_Y),
+            end_pos=(WIDTH, GROUND_Y),
+            width=3,
+        )
+        # Linea vertical de la pared
         if args.wall:
             pygame.draw.line(
-                screen,
-                (90, 90, 90),
-                (WALL_X, GROUND_Y),
-                (WALL_X, GROUND_Y - WALL_H),
-                8,
+                surface=screen,
+                color=colorFloor,
+                start_pos=(WALL_X, GROUND_Y),
+                end_pos=(WALL_X, GROUND_Y - WALL_H),
+                width=8,
             )
+        # Se dibuja el Target
         for ring, color in (
-            (TARGET_R, (200, 50, 50)),
+            (TARGET_R, (200, 50, 50)),  # anillos del target
             (TARGET_R // 2, (245, 245, 240)),
         ):
             pygame.draw.circle(screen, color, TARGET_POS, ring)
@@ -201,7 +214,13 @@ def run_gui(args: argparse.Namespace) -> None:
 
         for old in old_paths:  # rastro tenue de generaciones anteriores
             if len(old) > 1:
-                pygame.draw.lines(screen, (205, 205, 215), False, old, 1)
+                pygame.draw.lines(
+                    surface=screen,
+                    color=(205, 205, 215),
+                    closed=False,
+                    points=old,
+                    width=1,
+                )
 
         angle, power = decode(best.genes)
         tip = (
@@ -242,6 +261,8 @@ def run_gui(args: argparse.Namespace) -> None:
         old_paths.append(path)
         return True
 
+    # --- --- --- --- --- --- --- --- --- --- --- --- --- ---
+    # Se ejecuta el algoritmo genético
     last = None
     for gen, best in evolve(
         args.population, args.generations, wall=args.wall, seed=args.seed
@@ -251,6 +272,7 @@ def run_gui(args: argparse.Namespace) -> None:
         if not replay(gen, best):
             pygame.quit()
             return
+    # --- --- --- --- --- --- --- --- --- --- --- --- --- ---
 
     gen, best = last
     if args.screenshot:
@@ -270,8 +292,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Tiro al blanco con algoritmo genético"
     )
-    parser.add_argument("--population", type=int, default=20)
-    parser.add_argument("--generations", type=int, default=30)
+    parser.add_argument("--population", type=int, default=10)
+    parser.add_argument("--generations", type=int, default=10)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
         "--sin-muro", action="store_true", help="quita el muro intermedio"
@@ -296,11 +318,12 @@ def main() -> None:
         ):
             angle, power = decode(best.genes)
             logger.info(
-                "gen %2d | error %6.1f px | ángulo %5.1f° | potencia %6.0f",
+                "gen %2d | error %6.1f px | ángulo %5.1f° | potencia %6.0f | semilla %6.0f",
                 gen,
                 best.cost,
                 math.degrees(angle),
                 power,
+                args.seed,
             )
     else:
         run_gui(args)
