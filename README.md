@@ -161,3 +161,7 @@ y la configuración se hace **una sola vez**, en el punto de entrada.
 - [ ] Que `python -m ga_target_game` lance el juego
 - [ ] Tests del decodificador, de la simulación y de la evolución
 - [ ] Viento o blancos móviles para hacerlo más difícil
+
+## Licencia
+
+MIT. Ver LICENSE.
