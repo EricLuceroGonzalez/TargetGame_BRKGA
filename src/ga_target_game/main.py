@@ -15,6 +15,8 @@ Uso:
     uv run python src/ga_target_game/main.py --sin-muro   # sin obstáculo: casi trivial
     uv run python src/ga_target_game/main.py --no-gui     # solo evolución, por consola
     uv run python src/ga_target_game/main.py --seed 7 --generations 40
+    uv run python src/ga_target_game/main.py --fondo cartoon    # fondo dibujado
+    uv run python src/ga_target_game/main.py --solo-mejor       # solo el mejor tiro
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ HIT_DIST = TARGET_R + BALL_R  # a esta distancia del centro, la bola toca el bla
 WALL_X, WALL_H, WALL_W = 420.0, 400.0, 65
 
 # ── Decodificador: genes en [0, 1] -> parámetros reales ─────────────────────
-ANGLE_MIN, ANGLE_MAX = 2.0, 85.0  # grados
+ANGLE_MIN, ANGLE_MAX = 5.0, 85.0  # grados
 POWER_MIN, POWER_MAX = 100.0, 1400.0  # px/s
 
 
@@ -64,7 +66,7 @@ def decode(genes: list[float]) -> tuple[float, float]:
 
 # ── Simulación física (pymunk) ──────────────────────────────────────────────
 def simulate(
-    genes: list[float], wall: bool = False, record: bool = False
+    genes: list[float], wall: bool = False, record: bool = True
 ) -> tuple[float, list[tuple[float, float]]]:
     """Simula un tiro. Devuelve (fitness, trayectoria).
 
@@ -126,6 +128,9 @@ def simulate(
 class Individual:
     genes: list[float]
     cost: float
+    # De dónde salió en esta generación (solo para visualizarlo, el algoritmo
+    # no lo usa): "inicial" | "elite" | "mutante" | "cruce".
+    origin: str = "inicial"
 
 
 def evolve(
@@ -136,8 +141,10 @@ def evolve(
     rho: float = 0.7,
     wall: bool = False,
     seed: int | None = None,
-) -> Iterator[tuple[int, Individual]]:
-    """Generador: en cada generación entrega (número, mejor individuo).
+) -> Iterator[tuple[int, Individual, list[Individual]]]:
+    """Generador: en cada generación entrega (número, mejor, población ordenada).
+
+    La población va ordenada de mejor a peor, así que ``population[0] is best``.
 
     Args:
         pop_size: Individuos por generación.
@@ -156,21 +163,24 @@ def evolve(
     n_mutants = max(1, int(pop_size * mutant_frac))
     n_genes = 2  # tamaño del cromosoma: [llave del ángulo, llave de la potencia]
 
-    def new_individual(genes: list[float] | None = None) -> Individual:
+    def new_individual(
+        genes: list[float] | None = None, origin: str = "inicial"
+    ) -> Individual:
         # Sin genes -> vector de llaves aleatorias uniformes en [0, 1).
         # Se evalúa al crearlo, así cada individuo guarda su costo.
         genes = genes or [rng.random() for _ in range(n_genes)]
-        return Individual(genes, simulate(genes, wall)[0])
+        return Individual(genes, simulate(genes, wall)[0], origin)
 
     # [BRKGA] POBLACIÓN INICIAL: p vectores de llaves aleatorias.
     population = [new_individual() for _ in range(pop_size)]
+    print(f"seed = {seed}")
     print("===" * 20)
     # print(population)
     for gen in range(generations + 1):
         # [BRKGA] CLASIFICACIÓN: ordenar por costo (minimización).
         population.sort(key=lambda ind: ind.cost)
         best = population[0]
-        yield gen, best
+        yield gen, best, population
         # CRITERIO DE PARADA: acierto (costo 0) o agotar las generaciones.
         if best.cost == 0.0:
             return  # ya acierta: no hace falta seguir
@@ -179,10 +189,10 @@ def evolve(
         elite, rest = population[:n_elite], population[n_elite:]
         # [BRKGA] ELITISMO: la élite pasa intacta; no se re-evalúa porque la
         # simulación es determinista. Garantiza que el mejor nunca empeora.
-        next_pop = list(elite)
+        next_pop = [Individual(ind.genes, ind.cost, "elite") for ind in elite]
         # [BRKGA] MUTANTES: individuos totalmente aleatorios. BRKGA no tiene
         # operador de mutación gen a gen; la exploración viene de aquí.
-        next_pop += [new_individual() for _ in range(n_mutants)]
+        next_pop += [new_individual(origin="mutante") for _ in range(n_mutants)]
         # [BRKGA] CRUCE: completa la población con hijos.
         while len(next_pop) < pop_size:
             # Selección SESGADA: un padre siempre de la élite y otro del resto
@@ -197,12 +207,93 @@ def evolve(
                 e if rng.random() < rho else o
                 for e, o in zip(parent_e.genes, parent_o.genes, strict=True)
             ]
-            next_pop.append(new_individual(child))
+            next_pop.append(new_individual(child, "cruce"))
         # [BRKGA] REEMPLAZO GENERACIONAL: élite + mutantes + hijos.
         population = next_pop
 
 
 # ── Visualización (pygame) ──────────────────────────────────────────────────
+Point = tuple[float, float]
+
+# Color de cada trayectoria según el origen del individuo. El mejor se pinta
+# aparte, encima de todos, más grueso y en azul.
+ORIGIN_COLORS = {
+    "inicial": (150, 150, 165),
+    "elite": (225, 165, 30),
+    "mutante": (60, 170, 90),
+    "cruce": (170, 120, 200),
+}
+BEST_COLOR = (30, 60, 160)
+TEXT_COLOR = (30, 30, 30)
+
+
+def wall_rect() -> tuple[float, float, float, float]:
+    """Rectángulo (x, y, ancho, alto) que ocupa el muro en la física.
+
+    El ``pymunk.Segment`` tiene radio WALL_W/2: mide WALL_W de ancho y sobresale
+    WALL_W/2 por arriba del extremo superior.
+    """
+    top = GROUND_Y - WALL_H - WALL_W / 2
+    return (WALL_X - WALL_W / 2, top, WALL_W, GROUND_Y - top)
+
+
+def build_background(pygame, wall: bool, style: str):
+    """Dibuja una sola vez todo lo estático y lo devuelve como Surface.
+
+    En cada fotograma basta con ``screen.blit(fondo, (0, 0))``: copiar una
+    imagen ya hecha es mucho más barato que redibujar cielo, nubes y colinas.
+    """
+    bg = pygame.Surface((WIDTH, HEIGHT)).convert()
+    x, y, w, h = wall_rect()
+
+    if style == "simple":
+        bg.fill((245, 245, 240))
+        pygame.draw.line(bg, (60, 60, 60), (0, GROUND_Y), (WIDTH, GROUND_Y), 3)
+        if wall:
+            pygame.draw.rect(bg, (90, 90, 90), (x, y, w, h))
+        return bg
+
+    # ── estilo "cartoon": todo con primitivas, sin imágenes externas ──
+    # Cielo: degradado vertical, una línea por fila.
+    top_c, bottom_c = (110, 175, 235), (205, 235, 250)
+    for row in range(GROUND_Y):
+        t = row / GROUND_Y
+        color = [round(a + (b - a) * t) for a, b in zip(top_c, bottom_c, strict=True)]
+        pygame.draw.line(bg, color, (0, row), (WIDTH, row))
+
+    pygame.draw.circle(bg, (255, 235, 140), (660, 110), 46)  # sol
+
+    for cx, cy, s in ((150, 140, 1.0), (430, 90, 0.8), (600, 230, 0.6)):  # nubes
+        for dx, dy, r in ((0, 0, 30), (32, -12, 36), (68, 0, 28), (34, 10, 30)):
+            pygame.draw.circle(bg, (255, 255, 255), (cx + dx * s, cy + dy * s), r * s)
+
+    # Colinas: círculos grandes con el centro bajo el suelo; se ve solo su cima.
+    for cx, r, color in (
+        (120, 260, (120, 185, 110)),
+        (520, 330, (105, 170, 95)),
+        (820, 240, (125, 190, 115)),
+    ):
+        pygame.draw.circle(bg, color, (cx, GROUND_Y + r * 0.55), r)
+
+    # Suelo: franja de pasto y tierra debajo.
+    pygame.draw.rect(bg, (135, 95, 60), (0, GROUND_Y, WIDTH, HEIGHT - GROUND_Y))
+    pygame.draw.rect(bg, (90, 170, 70), (0, GROUND_Y - 4, WIDTH, 16))
+
+    # Resortera (decorativa): un poste y dos brazos en el punto de lanzamiento.
+    lx, ly = LAUNCH_POS
+    wood = (120, 75, 40)
+    pygame.draw.line(bg, wood, (lx, GROUND_Y), (lx, ly + 14), 8)
+    pygame.draw.line(bg, wood, (lx, ly + 14), (lx - 12, ly - 8), 6)
+    pygame.draw.line(bg, wood, (lx, ly + 14), (lx + 12, ly - 8), 6)
+
+    if wall:  # muro de tablones de madera, del tamaño exacto de la física
+        pygame.draw.rect(bg, (170, 115, 60), (x, y, w, h))
+        for py in range(int(y) + 40, GROUND_Y, 40):
+            pygame.draw.line(bg, (125, 80, 40), (x, py), (x + w, py), 2)
+        pygame.draw.rect(bg, (100, 60, 30), (x, y, w, h), 3)
+    return bg
+
+
 def run_gui(args: argparse.Namespace) -> None:
     import pygame
 
@@ -211,36 +302,39 @@ def run_gui(args: argparse.Namespace) -> None:
     pygame.display.set_caption("Tiro al blanco - algoritmo genético")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont(None, 26)
+    small = pygame.font.SysFont(None, 20)
+    background = build_background(pygame, args.wall, args.fondo)
 
-    old_paths: list[list[tuple[float, float]]] = []
+    # Cronómetro: tiempo real desde que se abre la ventana. Se congela cuando
+    # termina la evolución, así queda a la vista cuánto tardó en resolverse.
+    start_ms = pygame.time.get_ticks()
+    end_ms: int | None = None
 
-    def draw(frame_path, upto, gen, best, done) -> None:
-        screen.fill((245, 245, 240))
-        # Linea horizontal del suelo
-        colorFloor = (160, 160, 60)
-        pygame.draw.line(
-            surface=screen,
-            color=colorFloor,
-            start_pos=(0, GROUND_Y),
-            end_pos=(WIDTH, GROUND_Y),
-            width=3,
-        )
-        # Linea vertical de la pared
-        if args.wall:
-            pygame.draw.line(
-                surface=screen,
-                color=colorFloor,
-                start_pos=(WALL_X, GROUND_Y),
-                end_pos=(WALL_X, GROUND_Y - WALL_H),
-                width=8,
-            )
-        # Se dibuja el Target
-        for ring, color in (
-            (TARGET_R, (200, 50, 50)),  # anillos del target
-            (TARGET_R // 2, (245, 245, 240)),
-        ):
-            pygame.draw.circle(screen, color, TARGET_POS, ring)
+    def elapsed() -> str:
+        ms = (end_ms if end_ms is not None else pygame.time.get_ticks()) - start_ms
+        return f"{ms // 60000:02d}:{ms % 60000 / 1000:04.1f}"
+
+    old_paths: list[list[Point]] = []  # rastro de los mejores anteriores
+
+    def draw_target() -> None:
+        pygame.draw.circle(screen, (200, 50, 50), TARGET_POS, TARGET_R)
+        pygame.draw.circle(screen, (245, 245, 240), TARGET_POS, TARGET_R // 2)
         pygame.draw.circle(screen, (200, 50, 50), TARGET_POS, TARGET_R // 4)
+
+    def draw_legend(n: int) -> None:
+        items = [("mejor", BEST_COLOR)] + [
+            (name, color) for name, color in ORIGIN_COLORS.items() if name != "inicial"
+        ]
+        x0, y0 = WIDTH - 130, 14
+        screen.blit(small.render(f"{n} individuos", True, TEXT_COLOR), (x0, y0))
+        for i, (name, color) in enumerate(items):
+            y = y0 + 20 * (i + 1)
+            pygame.draw.circle(screen, color, (x0 + 6, y + 6), 5)
+            screen.blit(small.render(name, True, TEXT_COLOR), (x0 + 18, y))
+
+    def draw(paths, origins, upto, gen, best, done) -> None:
+        screen.blit(background, (0, 0))
+        draw_target()
 
         for old in old_paths:  # rastro tenue de generaciones anteriores
             if len(old) > 1:
@@ -259,61 +353,82 @@ def run_gui(args: argparse.Namespace) -> None:
         )
         pygame.draw.line(screen, (40, 40, 140), LAUNCH_POS, tip, 6)
 
-        shown = frame_path[: upto + 1]
+        # Resto de la generación: de peor a mejor, para que los buenos queden
+        # encima. paths[0] es el mejor y se dibuja al final.
+        for path, origin in reversed(list(zip(paths[1:], origins[1:], strict=True))):
+            shown = path[: upto + 1]
+            color = ORIGIN_COLORS.get(origin, ORIGIN_COLORS["inicial"])
+            if len(shown) > 1:
+                pygame.draw.lines(screen, color, False, shown, 1)
+            if shown:
+                pygame.draw.circle(screen, color, shown[-1], BALL_R // 2 + 1)
+
+        shown = paths[0][: upto + 1]
         if len(shown) > 1:
-            pygame.draw.lines(screen, (40, 90, 200), False, shown, 2)
+            pygame.draw.lines(screen, (40, 90, 200), False, shown, 3)
         if shown:
-            pygame.draw.circle(screen, (30, 60, 160), shown[-1], BALL_R)
+            pygame.draw.circle(screen, BEST_COLOR, shown[-1], BALL_R)
 
         status = "¡ACIERTO!" if best.cost == 0 else f"error {best.cost:6.1f} px"
+        flight = min(upto, len(paths[0]) - 1) * DT  # cada punto = un fotograma
         lines = [
-            f"Generación {gen}",
+            f"Generación {gen}   semilla {args.seed}",
             f"ángulo {math.degrees(angle):5.1f}°   potencia {power:6.0f}",
             status + ("  (final)" if done else ""),
+            f"tiempo {elapsed()}   vuelo {flight:4.2f} s",
             "ESC para salir",
         ]
         for i, text in enumerate(lines):
-            screen.blit(font.render(text, True, (30, 30, 30)), (14, 12 + 24 * i))
+            screen.blit(font.render(text, True, TEXT_COLOR), (14, 12 + 24 * i))
+        if len(paths) > 1:
+            draw_legend(len(paths))
         pygame.display.flip()
 
-    def replay(gen, best, done=False) -> bool:
-        """Anima el tiro de ``best``. Devuelve False si el usuario cierra la ventana."""
-        _, path = simulate(best.genes, args.wall, record=True)
-        for upto in range(0, len(path), args.speed):
+    def replay(gen, best, population, done=False) -> bool:
+        """Anima la generación (o solo ``best``). False si el usuario sale."""
+        shots = [best] if args.solo_mejor else population  # population[0] is best
+        # Volver a simular con record=True para obtener las trayectorias. Es
+        # barato (~0.5 ms por tiro) y evita guardar caminos durante evolve().
+        paths = [simulate(ind.genes, args.wall, record=True)[1] for ind in shots]
+        origins = [ind.origin for ind in shots]
+        longest = max(len(p) for p in paths)
+        for upto in range(0, longest, args.speed):
             for event in pygame.event.get():
                 if event.type == pygame.QUIT or (
                     event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
                 ):
                     return False
-            draw(path, upto, gen, best, done)
+            draw(paths, origins, upto, gen, best, done)
             clock.tick(60)
-        draw(path, len(path), gen, best, done)
-        old_paths.append(path)
+        draw(paths, origins, longest, gen, best, done)
+        if not done:
+            old_paths.append(paths[0])
         return True
 
     # --- --- --- --- --- --- --- --- --- --- --- --- --- ---
     # Se ejecuta el algoritmo genético
     last = None
-    for gen, best in evolve(
+    for gen, best, population in evolve(
         args.population, args.generations, wall=args.wall, seed=args.seed
     ):
         logger.info("gen %2d | error %.1f px", gen, best.cost)
-        last = (gen, best)
-        if not replay(gen, best):
+        last = (gen, best, population)
+        if not replay(gen, best, population):
             pygame.quit()
             return
     # --- --- --- --- --- --- --- --- --- --- --- --- --- ---
 
-    gen, best = last
+    end_ms = pygame.time.get_ticks()  # congela el cronómetro
+    gen, best, population = last
     if args.screenshot:
-        replay(gen, best, done=True)
+        replay(gen, best, population, done=True)
         pygame.image.save(screen, args.screenshot)
         pygame.quit()
         return
 
     running = True
-    while running:  # repite el mejor tiro hasta cerrar la ventana
-        running = replay(gen, best, done=True)
+    while running:  # repite la última generación hasta cerrar la ventana
+        running = replay(gen, best, population, done=True)
         pygame.time.wait(600)
     pygame.quit()
 
@@ -324,7 +439,7 @@ def main() -> None:
     )
     parser.add_argument("--population", type=int, default=10)
     parser.add_argument("--generations", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=52)
     parser.add_argument(
         "--sin-muro", action="store_true", help="quita el muro intermedio"
     )
@@ -337,13 +452,29 @@ def main() -> None:
     parser.add_argument(
         "--screenshot", default=None, help="guarda el último fotograma y sale"
     )
+    parser.add_argument(
+        "--solo-mejor",
+        action="store_true",
+        help="anima solo el mejor tiro (no toda la generación)",
+    )
+    parser.add_argument(
+        "--fondo",
+        choices=("simple", "cartoon"),
+        default="simple",
+        help="estilo del fondo",
+    )
     args = parser.parse_args()
     args.wall = not args.sin_muro
+    # Sin --seed se sortea una, pero se muestra: así cualquier corrida que
+    # salga interesante se puede repetir con --seed N.
+    if args.seed is None:
+        args.seed = random.SystemRandom().randrange(1_000_000)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logger.info("semilla %d", args.seed)
 
     if args.no_gui:
-        for gen, best in evolve(
+        for gen, best, _ in evolve(
             args.population, args.generations, wall=args.wall, seed=args.seed
         ):
             angle, power = decode(best.genes)
